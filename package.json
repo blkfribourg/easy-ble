@@ -1,0 +1,20 @@
+{
+  "name": "@blkfri/easy-ble",
+  "version": "1.0.0",
+  "description": "mod of official zeppos easy-ble package",
+  "main": "dist/ble-master.js",
+  "types": "ts/ble-master.d.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blkfribourg/easy-ble.git"
+  },
+  "author": "blkfri",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/blkfribourg/easy-ble/issues"
+  },
+  "homepage": "https://github.com/blkfribourg/easy-ble#readme"
+}
