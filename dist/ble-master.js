@@ -192,6 +192,7 @@ class BLEMaster {
      * @param {Function} [options.on_duration] - Callback function called when the scan stops after the specified duration.
      * @param {number} [options.throttle_interval=1000] - Interval in milliseconds to throttle the processing of scan results.
      * @param {boolean} [options.allow_duplicates=false] - Whether to include duplicate devices in each callback. Defaults to false.
+   
      * @example
      * // example: start scanning for devices and log each found device
      * .startScan((device) => { console.log('Found device:', device); }); 
@@ -213,6 +214,7 @@ class BLEMaster {
         let timer_started = false; // @fix 1.6.0
     
         const modified_callback = (scan_result) => {
+            debugLog(3, "Scan result received:", JSON.stringify(scan_result));
             const mac_address = ab2mac(scan_result.dev_addr);
             const scan_result_mod = {
                 ...scan_result,
@@ -229,7 +231,7 @@ class BLEMaster {
                 debugLog(3, `Adding new device ${mac_address}`);
                 this.#device_set.add(mac_address);
                 this.#devices[mac_address] = scan_result_mod;
-        
+                debugLog(3, `this.#devices`,JSON.stringify(this.#devices[mac_address]));
                 response_callback(scan_result_mod);
             } else if (allow_duplicates) {
                 // handle duplicates with batching and throttling
@@ -300,6 +302,7 @@ class BLEMaster {
      * @returns {boolean} true if the connection attempt started successfully, false otherwise.
      */
     connect(dev_addr, response_callback) {
+        debugLog(2, "[DEBUG] BLEMaster.connect called for", dev_addr);
         if (!dev_addr) {
             debugLog(1, ERR.DEVICE_ADDR_UNDEFINED);
             return false;
@@ -343,7 +346,8 @@ class BLEMaster {
             response_callback({ connected: true, status: "connected" });
             return true;
         }
-    
+
+        debugLog(2, "[DEBUG] Registering connection callback for", dev_addr);
         this.#initiateConnection(dev_addr, response_callback, attempt, max_attempts, timeout_duration);
         return true;
     }
@@ -450,13 +454,17 @@ class BLEMaster {
                 return;
             }
             this.#prepare_starting = true;
-
             debugLog(2, "mstOnPrepare callback triggered", JSON.stringify(backend_response));
+            // Defensive: handle undefined backend_response or status
+            let status_info;
+            if (backend_response && typeof backend_response.status !== "undefined") {
+                status_info = BX_CORE_CODES[backend_response.status.toString()] ||
+                              { message: "Unknown Error", code: "UNKNOWN" };
+            } else {
+                status_info = { message: "No backend response or status", code: "NO_BACKEND_RESPONSE" };
+            }
 
-            const status_info = BX_CORE_CODES[backend_response.status.toString()] || 
-                                { message: "Unknown Error", code: "UNKNOWN" };
-
-            const is_success = backend_response.status === 0;
+            const is_success = backend_response && backend_response.status === 0;
             if (is_success) {
                 // Save the listener instance
                 this.#devices[dev_addr].profile_pid = backend_response.profile;
@@ -488,6 +496,12 @@ class BLEMaster {
             if (!success) {
                 this.#listener_starting = false;
                 this.#prepare_starting = false;
+                // --- Add: callback for build profile failure ---
+                response_callback({
+                    success: false,
+                    message: "mstBuildProfile failed. Bluetooth stack error. Please restart the watch.",
+                    code: "BUILD_PROFILE_FAILED"
+                });
             }
         }, SHORT_DELAY);
     }
@@ -674,41 +688,48 @@ class BLEMaster {
         device.is_connected = false;
     }
 
-    #initiateConnection(dev_addr, response_callback){
+    #initiateConnection(dev_addr, response_callback) {
+        debugLog(2, "[DEBUG] #initiateConnection called for", dev_addr, "Callback:", typeof response_callback);
         this.#connection_in_progress = true;
-    
+
         const dev_addr_ab = mac2ab(dev_addr);
 
         hmBle.mstConnect(dev_addr_ab, (result) => {
-            // BUG: dev_addr: ab2mac(result.dev_addr) | sometimes the backend returns this random mac here: 70:53:36:8e:0b:c0
-            // It looks like this MAC is returned when connected status is either 1 or 2 but not 0
-            // test for abnormal MAC address
+            debugLog(2, "[DEBUG] mstConnect callback fired for", dev_addr, "Result:", JSON.stringify(result));
+            // Handle MAC address discrepancy
             const backend_mac = ab2mac(result.dev_addr);
             if (backend_mac !== dev_addr) {
-                debugLog(1, `Discrepancy in MAC addresses. Backend MAC: ${backend_mac}, Expected MAC: ${dev_addr}`); // @fix 1.5.8
-            dev_addr = backend_mac; // always trust the backend MAC BLK
+                debugLog(1, `Discrepancy in MAC addresses. Backend MAC: ${backend_mac}, Expected MAC: ${dev_addr}`);
+                dev_addr = backend_mac; // trust the backend MAC
             }
-           
-            // SOLUTION: assigning a user provided MAC instead of the one returned from the scan
-            const result_mod = { ...result, dev_addr: dev_addr }; // dev_addr: ab2mac(result.dev_addr)
+            
+            const result_mod = { ...result, dev_addr: dev_addr };
 
             if (result_mod.connected === 0) {
-                //check if device correcltuy populated
-                // handle the case where user doesn't use scan and connects directly
-                // check if the device is already in the dict, if not add it
-                if (!this.#devices[dev_addr]) { // @add 1.2.2
+                debugLog(2, "[DEBUG] mstConnect: Connection successful, calling response_callback with connected=true for", dev_addr);
+                // Always ensure device exists in #devices
+                if (!this.#devices[dev_addr]) {
                     this.#devices[dev_addr] = {
-                        dev_name: "default", // assign default value as the user didn't use the .scan()
+                        dev_addr: dev_addr,
+                        dev_name: "unknown",  // Can be updated later if needed
                         connect_id: result.connect_id,
                         is_connected: true,
                     };
+                    // Add to device set if not present
+                    if (!this.#device_set.has(dev_addr)) {
+                        this.#device_set.add(dev_addr);
+                    }
                 }
-                debugLog(1,'BLK initConn: connected devices:', JSON.stringify(this.#devices));
+
+                debugLog(1, 'Connected devices:', JSON.stringify(this.#devices));
                 this.#handleSuccessfulConnection(result_mod);
-                response_callback({ connected: true,mac:dev_addr, status: "connected" });
+                response_callback({ connected: true, mac: dev_addr, status: "connected" });
             } else {
-                debugLog(1,'Disconnection happened');
-                this.#devices[dev_addr].is_connected = false;
+                debugLog(2, "[DEBUG] mstConnect: Disconnection or failure, calling response_callback with connected=false for", dev_addr);
+                if (this.#devices[dev_addr]) {
+                    debugLog(1, 'Disconnection happened');
+                    this.#devices[dev_addr].is_connected = false;
+                }
                 response_callback({ 
                     connected: false, 
                     mac: dev_addr,
