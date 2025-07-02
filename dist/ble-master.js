@@ -423,8 +423,8 @@ class BLEMaster {
             debugLog(2, "Listener start already in progress");
             response_callback({ 
                 success: false, 
-                message: status_info.message,
-                code: status_info.code 
+                message: "Listener start already in progress",
+                code: "LISTENER_ALREADY_STARTING"
             });
             return;
             
@@ -508,6 +508,10 @@ class BLEMaster {
 
     // Add a method to stop a specific listener
     stopListener(dev_addr) {
+        if (!this.#devices[dev_addr]) {
+            debugLog(2, `No device found for ${dev_addr} in stopListener.`);
+            return;
+        }
         const profile_pid = this.#devices[dev_addr].profile_pid;
         if (profile_pid !== undefined) {
             debugLog(3, `Stopping listener for ${dev_addr}`);
