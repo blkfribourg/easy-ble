@@ -1,6 +1,6 @@
 /** @about BLE Master 1.6.9 @min_zeppos 3.0 @author: Silver, Zepp Health. @license: MIT */
 import * as hmBle from '@zos/ble'
-import { back } from '@zos/router';
+import { SysTimer } from "./systimer.src";
 
 // DEBUG_LOG_PRIORITY levels:
 // 0 - No logs
@@ -127,7 +127,7 @@ const ERR = {
 };
 
 // default class
-class BLEMaster {
+export class BLEMaster {
     #devices = {};
     #queueManagers = {};
     //#last_connected_mac = null;
@@ -137,7 +137,26 @@ class BLEMaster {
     #is_scanning = false;
     #device_set = new Set(); // filter uniques
     #get_helper; // @add 1.6.7
+	/**
+ * Creates an instance of BLEMaster.
+ * Initializes internal state and sets up write and read operations.
+ * @param {Object} [options={}] - Optional configuration for BLEMaster.
+ * @param {boolean} [options.background=false] - Whether to use system timer for background `(app-service)` operation.
+ * @example
+ * // example: create instance for use with UI (default)
+ * const ble = new BLEMaster();
+ * // advanced: create instance for background use
+ * const ble = new BLEMaster({ background: true });
+ */
+	constructor(options = {}) {
+		const queueManager = new QueueManager();
 
+	
+
+		if (options.background) {
+			SysTimer.setOptions({ use_systimer: true });
+		}
+	}
     
     /**
      * @type {Write} A device writer.
@@ -175,14 +194,7 @@ class BLEMaster {
         return this.#last_connected_mac ? this.#devices[this.#last_connected_mac] : null;
     }
 */
-    constructor(){
-        /*
-        const queueManager = new QueueManager();
 
-        this.write = new Write(() => this.#getCurrentlyConnectedDevice(), queueManager);
-        this.read = new Read(() => this.#getCurrentlyConnectedDevice(), queueManager);
-        */
-    }
 
     /**
      * Starts scanning for BLE devices.
@@ -240,7 +252,7 @@ class BLEMaster {
                 if (!timer_started) {
                     debugLog(3, `Starting throttle timer at ${new Date().toISOString()}`);
                     timer_started = true;
-                    setTimeout(() => {
+                    this.#setTimeout(() => {
                         debugLog(3, `Processing batch at ${new Date().toISOString()}`);
                         device_batch.forEach(device => response_callback(device));
                         device_batch = [];
@@ -253,7 +265,7 @@ class BLEMaster {
         const success = hmBle.mstStartScan(modified_callback);
     
         if (duration !== undefined) {
-            setTimeout(() => {
+            this.#setTimeout(() => {
                 this.stopScan();
                 if (on_duration) {
                     on_duration();
@@ -440,7 +452,7 @@ class BLEMaster {
 
         debugLog(3, "Starting listener with profile object", JSON.stringify(profile_object));
 
-        let prepareTimeout = setTimeout(() => {
+        let prepareTimeout = this.#setTimeout(() => {
             debugLog(1, "mstOnPrepare did not respond in time, retrying startListener...");
             this.#listener_starting = false;
             this.startListener(profile_object, dev_addr, response_callback);
@@ -448,7 +460,7 @@ class BLEMaster {
         
         // Register the listener
         hmBle.mstOnPrepare((backend_response) => {
-            clearTimeout(prepareTimeout); 
+            SysTimer.clear(prepareTimeout); 
             if (this.#prepare_starting) {
                 debugLog(2, "Prepare start already in progress");
                 return;
@@ -472,9 +484,9 @@ class BLEMaster {
                 this.on[dev_addr] = new On(backend_response.profile);
                 this.off[dev_addr] = new Off(this.on[dev_addr]);
                 this.#queueManagers[dev_addr] = new QueueManager();
-                this.write[dev_addr] = new Write(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr]);
-                console.log(`created write instance for ${dev_addr}, device object is:`, JSON.stringify(this.#devices[dev_addr]));
-                this.read[dev_addr] = new Read(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr]);
+                this.write[dev_addr] = new Write(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr],this.#setTimeout.bind(this));
+                console.log(`created write instance for ${dev_addr}, device object is:`, JSON.stringify(this.#devices[dev_addr]),this.#setTimeout.bind(this));
+                this.read[dev_addr] = new Read(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr],this.#setTimeout.bind(this));
 
                 response_callback({ success: true, message: status_info.message });
             } else {
@@ -489,7 +501,7 @@ class BLEMaster {
             this.#prepare_starting = false;
         });
 
-        setTimeout(() => {
+        this.#setTimeout(() => {
             const success = hmBle.mstBuildProfile(profile_object);
             debugLog(2, "mstBuildProfile called with success:", success);
 
@@ -756,6 +768,9 @@ class BLEMaster {
 
       
     }
+    #setTimeout(callback, delay, ...args) {
+        return SysTimer.setTimeout(callback, delay, ...args);
+    }
 
     // === STATIC SETTERS/GETTERS === //
 
@@ -813,11 +828,12 @@ class Write {
     #getCurrentDevice;
     #queueManager;
     #onInstance;
-
+    #setTimeout;
     constructor(getCurrentDevice, queueManager, onInstance) {
         this.#getCurrentDevice = getCurrentDevice;
         this.#queueManager = queueManager;
         this.#onInstance = onInstance;
+        this.#setTimeout = setTimeout;
     }
 
     /**
@@ -960,7 +976,7 @@ class Write {
                 
                 } else {
                     // keep checking
-                    setTimeout(cb_check_completion, check_interval);
+                    this.#setTimeout(cb_check_completion, check_interval);
                 }
             } else {
                 debugLog(1, ERR.PID_NOT_FOUND);
@@ -976,11 +992,13 @@ class Read {
     #getCurrentDevice;
     #queueManager;
     #onInstance;
+    #setTimeout;
 
     constructor(getCurrentDevice, queueManager, onInstance) {
         this.#getCurrentDevice = getCurrentDevice;
         this.#queueManager = queueManager;
         this.#onInstance = onInstance;
+        this.#setTimeout = setTimeout;
     }
 
     /**
@@ -1077,7 +1095,7 @@ class Read {
                     on_instance._setCharaReadCompleteFlag(false);
                     callback(); // ok
                 } else {
-                    setTimeout(cb_check_completion, check_interval);
+                    this.#setTimeout(cb_check_completion, check_interval);
                 }
             } else {
                 debugLog(1, ERR.PID_NOT_FOUND);
@@ -1967,7 +1985,7 @@ export function ab2str(buffer) {
     return String.fromCharCode.apply(null, new Uint8Array(buffer));
 }
 
-export default BLEMaster;
+
 
 /**
  * @changelog
