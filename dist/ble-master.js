@@ -484,9 +484,9 @@ export class BLEMaster {
                 this.on[dev_addr] = new On(backend_response.profile);
                 this.off[dev_addr] = new Off(this.on[dev_addr]);
                 this.#queueManagers[dev_addr] = new QueueManager();
-                this.write[dev_addr] = new Write(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr],this.#setTimeout.bind(this));
-                console.log(`created write instance for ${dev_addr}, device object is:`, JSON.stringify(this.#devices[dev_addr]),this.#setTimeout.bind(this));
-                this.read[dev_addr] = new Read(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr],this.#setTimeout.bind(this));
+                this.write[dev_addr] = new Write(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr], this.#setTimeout.bind(this));
+                console.log(`created write instance for ${dev_addr}, device object is:`, JSON.stringify(this.#devices[dev_addr]), this.#setTimeout.bind(this));
+                this.read[dev_addr] = new Read(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr], this.#setTimeout.bind(this));
 
                 response_callback({ success: true, message: status_info.message });
             } else {
@@ -707,19 +707,34 @@ export class BLEMaster {
     #initiateConnection(dev_addr, response_callback) {
         debugLog(2, "[DEBUG] #initiateConnection called for", dev_addr, "Callback:", typeof response_callback);
         this.#connection_in_progress = true;
-
+        
+        const original_mac = dev_addr; // Keep reference to original MAC
         const dev_addr_ab = mac2ab(dev_addr);
 
         hmBle.mstConnect(dev_addr_ab, (result) => {
             debugLog(2, "[DEBUG] mstConnect callback fired for", dev_addr, "Result:", JSON.stringify(result));
             // Handle MAC address discrepancy
             const backend_mac = ab2mac(result.dev_addr);
-            if (backend_mac !== dev_addr) {
-                debugLog(1, `Discrepancy in MAC addresses. Backend MAC: ${backend_mac}, Expected MAC: ${dev_addr}`);
-                dev_addr = backend_mac; // trust the backend MAC
+            const mac_changed = backend_mac !== dev_addr;
+            
+            if (mac_changed) {
+                debugLog(1, `MAC address discrepancy detected. Original: ${original_mac}, Backend: ${backend_mac}`);
+                // Update device tracking with MAC mapping
+                if (this.#devices[original_mac] && !this.#devices[backend_mac]) {
+                    this.#devices[backend_mac] = { ...this.#devices[original_mac] };
+                    this.#devices[backend_mac].dev_addr = backend_mac;
+                    this.#devices[backend_mac].original_mac = original_mac;
+                    debugLog(2, `Created device entry mapping: ${original_mac} -> ${backend_mac}`);
+                }
+                dev_addr = backend_mac; // Use backend MAC for operations
             }
             
-            const result_mod = { ...result, dev_addr: dev_addr };
+            const result_mod = { 
+                ...result, 
+                dev_addr: backend_mac,
+                original_mac: original_mac,
+                mac_changed: mac_changed
+            };
 
             if (result_mod.connected === 0) {
                 debugLog(2, "[DEBUG] mstConnect: Connection successful, calling response_callback with connected=true for", dev_addr);
@@ -739,7 +754,13 @@ export class BLEMaster {
 
                 debugLog(1, 'Connected devices:', JSON.stringify(this.#devices));
                 this.#handleSuccessfulConnection(result_mod);
-                response_callback({ connected: true, mac: dev_addr, status: "connected" });
+                response_callback({ 
+                    connected: true, 
+                    mac: backend_mac, 
+                    original_mac: original_mac,
+                    mac_changed: mac_changed,
+                    status: "connected" 
+                });
             } else {
                 debugLog(2, "[DEBUG] mstConnect: Disconnection or failure, calling response_callback with connected=false for", dev_addr);
                 if (this.#devices[dev_addr]) {
@@ -748,7 +769,9 @@ export class BLEMaster {
                 }
                 response_callback({ 
                     connected: false, 
-                    mac: dev_addr,
+                    mac: backend_mac,
+                    original_mac: original_mac,
+                    mac_changed: mac_changed,
                     status: result_mod.connected === 1 ? "failed" : "disconnected" 
                 });
             }
@@ -771,6 +794,7 @@ export class BLEMaster {
     #setTimeout(callback, delay, ...args) {
         return SysTimer.setTimeout(callback, delay, ...args);
     }
+
 
     // === STATIC SETTERS/GETTERS === //
 
@@ -829,11 +853,11 @@ class Write {
     #queueManager;
     #onInstance;
     #setTimeout;
-    constructor(getCurrentDevice, queueManager, onInstance) {
+    constructor(getCurrentDevice, queueManager, onInstance, setTimeoutFn) {
         this.#getCurrentDevice = getCurrentDevice;
         this.#queueManager = queueManager;
         this.#onInstance = onInstance;
-        this.#setTimeout = setTimeout;
+        this.#setTimeout = setTimeoutFn || setTimeout;
     }
 
     /**
@@ -994,11 +1018,11 @@ class Read {
     #onInstance;
     #setTimeout;
 
-    constructor(getCurrentDevice, queueManager, onInstance) {
+    constructor(getCurrentDevice, queueManager, onInstance, setTimeoutFn) {
         this.#getCurrentDevice = getCurrentDevice;
         this.#queueManager = queueManager;
         this.#onInstance = onInstance;
-        this.#setTimeout = setTimeout;
+        this.#setTimeout = setTimeoutFn || setTimeout;
     }
 
     /**
