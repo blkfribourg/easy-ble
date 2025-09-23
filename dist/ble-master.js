@@ -13,7 +13,7 @@ let DEBUG_LOG_LEVEL = 1; // set to 0 if you need no logs
 
 // A short delay in milliseconds to ensure BLE backend readiness before profile creation.
 // Used in `startListener` to avoid race conditions between `mstOnPrepare` and `mstBuildProfile`.
-const SHORT_DELAY = 100; // Increase delay to 100ms
+const SHORT_DELAY = 50; // Optimal delay for ZeppOS BLE timing (original implementation)
 
 /**
  * Object containing BLE permissions.
@@ -132,7 +132,10 @@ export class BLEMaster {
     #queueManagers = {};
     //#last_connected_mac = null;
     #connection_in_progress = false;
+    #active_connections = new Map(); // Track persistent connection attempts for session continuity
+    #connection_failures = new Map(); // Track connection failures per device for throttling
     #listener_starting = false;
+    #listeners_starting = new Set(); // Track per-device listener starting state
     #prepare_starting = false;
     #is_scanning = false;
     #device_set = new Set(); // filter uniques
@@ -315,12 +318,49 @@ export class BLEMaster {
      */
     connect(dev_addr, response_callback) {
         debugLog(2, "[DEBUG] BLEMaster.connect called for", dev_addr);
+        debugLog(2, `[CONNECT DEBUG] Device already connected check: ${this.#devices[dev_addr]?.is_connected}`);
         if (!dev_addr) {
             debugLog(1, ERR.DEVICE_ADDR_UNDEFINED);
             return false;
         }
 
+        // Check connection failure throttling - Telemetry-optimized timing
+        const failureData = this.#connection_failures.get(dev_addr);
+        if (failureData) {
+            const now = Date.now();
+            const timeSinceLastFailure = now - failureData.lastFailure;
+            
+            // Telemetry-friendly aggressive timing: 300ms, 500ms, 1s, 2s max
+            let requiredDelay;
+            if (failureData.count === 1) requiredDelay = 300;      // 300ms after first failure
+            else if (failureData.count === 2) requiredDelay = 500; // 500ms after second failure  
+            else if (failureData.count === 3) requiredDelay = 1000; // 1s after third failure
+            else requiredDelay = 2000; // 2s max for 4+ failures
+            
+            if (timeSinceLastFailure < requiredDelay) {
+                const remainingDelay = requiredDelay - timeSinceLastFailure;
+                debugLog(2, `[THROTTLE] Telemetry throttle for ${dev_addr}. ${failureData.count} recent failures, wait ${remainingDelay}ms more`);
+                
+                // Schedule retry after throttle period
+                setTimeout(() => {
+                    this.connect(dev_addr, response_callback);
+                }, remainingDelay);
+                return true; // Return true to indicate the connection request is accepted (will be retried)
+            }
+            
+        }
+
         debugLog(3, `Attempting to connect to device: ${dev_addr}`);
+        
+        // Add detailed connection state debugging
+        const currentFailures = this.#connection_failures.get(dev_addr);
+        if (currentFailures) {
+            debugLog(2, `[RECONNECT DEBUG] Connection attempt for ${dev_addr} with ${currentFailures.count} previous failures`);
+            debugLog(2, `[RECONNECT DEBUG] Last failure was ${Date.now() - currentFailures.lastFailure}ms ago`);
+        }
+        
+        debugLog(2, `[RECONNECT DEBUG] Device state before connection: connected=${this.#devices[dev_addr]?.is_connected}, in_progress=${this.#connection_in_progress}`);
+        
         dev_addr = dev_addr.toLowerCase();
 
         // if dev_addr is a pattern, find the first device that matches the pattern
@@ -349,17 +389,26 @@ export class BLEMaster {
     
         if (this.#connection_in_progress) {
             debugLog(2, "Connection already in progress for:", dev_addr);
-            response_callback({ connected: false, status: "in progress" });
-            return false;
+            
+            // If it's the same device, clear stale connection state to prevent deadlock
+            if (this.#connection_in_progress === dev_addr) {
+                debugLog(2, `Clearing stale connection state for ${dev_addr} to prevent deadlock`);
+                this.#connection_in_progress = null;
+            } else {
+                response_callback({ connected: false, status: "in progress" });
+                return false;
+            }
         }
     
         if (this.#devices[dev_addr]?.is_connected) {
             debugLog(2, "Device already connected:", dev_addr);
+            debugLog(2, `[CONNECT DEBUG] Taking already-connected path, calling callback immediately`);
             response_callback({ connected: true, status: "connected" });
             return true;
         }
 
         debugLog(2, "[DEBUG] Registering connection callback for", dev_addr);
+        debugLog(2, `[CONNECT DEBUG] Taking new connection path, calling #initiateConnection`);
         this.#initiateConnection(dev_addr, response_callback, attempt, max_attempts, timeout_duration);
         return true;
     }
@@ -430,16 +479,26 @@ export class BLEMaster {
      * 
      * @returns {void} This method doesn't return a value but invokes the response callback with the result of the profile preparation.
      */
-    startListener(profile_object, dev_addr, response_callback) {
-        if (this.#listener_starting) {
-            debugLog(2, "Listener start already in progress");
+    startListener(profile_object, dev_addr, response_callback, retryCount = 0) {
+        // Check if listener is already starting for this specific device
+        if (this.#listeners_starting.has(dev_addr)) {
+            debugLog(2, `Listener start already in progress for device ${dev_addr} - skipping`);
             response_callback({ 
                 success: false, 
-                message: "Listener start already in progress",
+                message: `Listener start already in progress for device ${dev_addr}`,
                 code: "LISTENER_ALREADY_STARTING"
             });
             return;
-            
+        }
+        
+        // Check global listener starting state for backward compatibility and system-wide conflicts
+        if (this.#listener_starting) {
+            debugLog(2, "Global listener start in progress - queuing request");
+            // Instead of failing, queue this request to be retried
+            setTimeout(() => {
+                this.startListener(profile_object, dev_addr, response_callback, retryCount);
+            }, 500); // Retry after 500ms
+            return;
         }
 
         // Check if a listener is already active for this device
@@ -448,15 +507,38 @@ export class BLEMaster {
             this.stopListener(dev_addr); // Gracefully stop the existing listener
         }
 
+        // Mark both global and device-specific listener starting
         this.#listener_starting = true;
+        this.#listeners_starting.add(dev_addr);
 
-        debugLog(3, "Starting listener with profile object", JSON.stringify(profile_object));
+        debugLog(3, `Starting listener for device ${dev_addr} with profile object`, JSON.stringify(profile_object));
 
         let prepareTimeout = this.#setTimeout(() => {
-            debugLog(1, "mstOnPrepare did not respond in time, retrying startListener...");
-            this.#listener_starting = false;
-            this.startListener(profile_object, dev_addr, response_callback);
-        }, 5000); // 5 seconds timeout
+            debugLog(1, `mstOnPrepare did not respond in time for ${dev_addr} (attempt ${retryCount + 1}/3)`);
+            
+            if (retryCount < 2) { // Allow up to 3 attempts (0, 1, 2)
+                // Cleanup current attempt before retry
+                this.#cleanupFailedListener(dev_addr);
+                
+                // Exponential backoff: 1s, 2s delays
+                const delay = Math.pow(2, retryCount) * 1000;
+                debugLog(2, `Retrying startListener for ${dev_addr} in ${delay}ms (attempt ${retryCount + 2}/3)`);
+                
+                setTimeout(() => {
+                    this.startListener(profile_object, dev_addr, response_callback, retryCount + 1);
+                }, delay);
+            } else {
+                // Clean failure after 3 attempts
+                debugLog(1, `startListener failed for ${dev_addr} after 3 attempts - giving up`);
+                this.#cleanupFailedListener(dev_addr);
+                
+                response_callback({ 
+                    connected: false, 
+                    status: "listener_failed",
+                    reason: "mstOnPrepare timeout after 3 attempts"
+                });
+            }
+        }, 8000); // Increased timeout to 8 seconds
         
         // Register the listener
         hmBle.mstOnPrepare((backend_response) => {
@@ -485,7 +567,7 @@ export class BLEMaster {
                 this.off[dev_addr] = new Off(this.on[dev_addr]);
                 this.#queueManagers[dev_addr] = new QueueManager();
                 this.write[dev_addr] = new Write(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr], this.#setTimeout.bind(this));
-                console.log(`created write instance for ${dev_addr}, device object is:`, JSON.stringify(this.#devices[dev_addr]), this.#setTimeout.bind(this));
+                // Write instance created for device
                 this.read[dev_addr] = new Read(() => this.#devices[dev_addr], this.#queueManagers[dev_addr], this.on[dev_addr], this.#setTimeout.bind(this));
 
                 response_callback({ success: true, message: status_info.message });
@@ -498,6 +580,7 @@ export class BLEMaster {
             }
 
             this.#listener_starting = false;
+            this.#listeners_starting.delete(dev_addr);
             this.#prepare_starting = false;
         });
 
@@ -507,6 +590,7 @@ export class BLEMaster {
 
             if (!success) {
                 this.#listener_starting = false;
+                this.#listeners_starting.delete(dev_addr);
                 this.#prepare_starting = false;
                 // --- Add: callback for build profile failure ---
                 response_callback({
@@ -529,6 +613,83 @@ export class BLEMaster {
             debugLog(3, `Stopping listener for ${dev_addr}`);
             hmBle.mstDestroyProfileInstance(profile_pid);
             delete this.#devices[dev_addr].profile_pid
+        }
+    }
+
+    /**
+     * Clean up failed listener attempt - handles partial states and resource cleanup
+     * @param {string} dev_addr - Device MAC address
+     */
+    #cleanupFailedListener(dev_addr) {
+        debugLog(2, `Cleaning up failed listener attempt for ${dev_addr}`);
+        
+        // Clear listener state flags
+        this.#listener_starting = false;
+        this.#listeners_starting.delete(dev_addr);
+        this.#prepare_starting = false;
+        
+        // Stop any existing listener to clean up partial profile states
+        this.stopListener(dev_addr);
+        
+        // Clean up any partially created resources
+        if (this.on[dev_addr]) {
+            delete this.on[dev_addr];
+        }
+        if (this.off[dev_addr]) {
+            delete this.off[dev_addr];
+        }
+        if (this.write[dev_addr]) {
+            delete this.write[dev_addr];
+        }
+        if (this.#queueManagers[dev_addr]) {
+            delete this.#queueManagers[dev_addr];
+        }
+    }
+
+    /**
+     * Attempt BLE stack recovery when mstConnect calls stop responding
+     * @param {string} dev_addr - Device MAC address
+     * @param {string} original_mac - Original MAC address
+     * @param {function} response_callback - Callback to call with result
+     */
+    #attemptBLEStackRecovery(dev_addr, original_mac, response_callback) {
+        debugLog(1, `[BLE RECOVERY] Attempting BLE stack recovery for ${dev_addr}`);
+        
+        try {
+            // Clear all BLE callbacks to reset stack state
+            hmBle.mstOffAllCb();
+            debugLog(2, `[BLE RECOVERY] Cleared all BLE callbacks`);
+            
+            // Wait a moment for stack to settle, then retry connection
+            setTimeout(() => {
+                debugLog(2, `[BLE RECOVERY] Retrying connection after stack recovery for ${dev_addr}`);
+                
+                // Reset failure count to give device a fresh chance
+                if (this.#connection_failures.has(original_mac)) {
+                    const failureData = this.#connection_failures.get(original_mac);
+                    failureData.count = Math.max(0, failureData.count - 10); // Reduce by 10
+                    debugLog(2, `[BLE RECOVERY] Reduced failure count to ${failureData.count} for ${original_mac}`);
+                }
+                
+                // Call the response callback with recovery status
+                response_callback({
+                    connected: false,
+                    mac: dev_addr,
+                    original_mac: original_mac,
+                    mac_changed: false,
+                    status: "ble_recovery_attempted"
+                });
+            }, 2000); // 2 second delay for stack recovery
+            
+        } catch (error) {
+            debugLog(1, `[BLE RECOVERY] Recovery failed: ${error}`);
+            response_callback({
+                connected: false,
+                mac: dev_addr,
+                original_mac: original_mac,
+                mac_changed: false,
+                status: "ble_recovery_failed"
+            });
         }
     }
 
@@ -704,14 +865,92 @@ export class BLEMaster {
         device.is_connected = false;
     }
 
+    /**
+     * Find the backend MAC address for a given original MAC by checking device mappings
+     * @param {string} original_mac - The original MAC address
+     * @returns {string|null} The backend MAC if found, null otherwise
+     */
+    #findBackendMacForOriginal(original_mac) {
+        // First check if any device has this original_mac stored (for MAC changed cases)
+        for (const [backend_mac, device] of Object.entries(this.#devices)) {
+            if (device.original_mac === original_mac) {
+                debugLog(2, `[MAC LOOKUP] Found backend MAC ${backend_mac} for original MAC ${original_mac}`);
+                return backend_mac;
+            }
+        }
+        
+        // If no mapping found, check if the original MAC itself exists as a device (no MAC change case)
+        if (this.#devices[original_mac]) {
+            debugLog(2, `[MAC LOOKUP] Original MAC ${original_mac} exists as device (no MAC change)`);
+            return original_mac;
+        }
+        
+        debugLog(2, `[MAC LOOKUP] No backend MAC mapping found for original MAC ${original_mac}`);
+        return null;
+    }
+
     #initiateConnection(dev_addr, response_callback) {
         debugLog(2, "[DEBUG] #initiateConnection called for", dev_addr, "Callback:", typeof response_callback);
-        this.#connection_in_progress = true;
         
         const original_mac = dev_addr; // Keep reference to original MAC
+        
+        // Check if we know the backend MAC for this device from previous connections
+        const possibleBackendMac = this.#findBackendMacForOriginal(original_mac);
+        
+        // Check for existing connection attempts (only if there's actually a connection in progress)
+        if (this.#connection_in_progress) {
+            if (possibleBackendMac && this.#active_connections.has(possibleBackendMac)) {
+                debugLog(2, `Connection attempt already in progress for backend MAC ${possibleBackendMac}, adding callback to queue`);
+                const existingCallbacks = this.#active_connections.get(possibleBackendMac);
+                existingCallbacks.push(response_callback);
+                return;
+            }
+            
+            if (this.#active_connections.has(`temp_${original_mac}`)) {
+                debugLog(2, `Connection attempt already in progress for ${original_mac} (temp storage), adding callback to queue`);
+                const existingCallbacks = this.#active_connections.get(`temp_${original_mac}`);
+                existingCallbacks.push(response_callback);
+                return;
+            }
+        } else {
+            debugLog(2, `[CALLBACK DEBUG] Found persistent callbacks for ${possibleBackendMac || original_mac}, but no connection in progress - starting fresh connection`);
+        }
+        
+
+        // Store callback temporarily during connection resolution (will be moved to backend MAC once known)
+        debugLog(2, `[CALLBACK DEBUG] Temporarily storing callback for ${original_mac} during connection resolution`);
+        debugLog(2, `[RECONNECT DEBUG] Starting actual mstConnect call for ${original_mac}`);
+        this.#active_connections.set(`temp_${original_mac}`, [response_callback]);
+        this.#connection_in_progress = dev_addr; // Store which device is connecting to prevent deadlock
         const dev_addr_ab = mac2ab(dev_addr);
 
+        // Add timeout to detect when mstConnect doesn't respond (BLE stack stuck)
+        let connectTimeout = this.#setTimeout(() => {
+            debugLog(1, `[BLE RECOVERY] mstConnect timeout for ${dev_addr} - BLE stack may be stuck`);
+            this.#connection_in_progress = false;
+            
+            // Check failure count to determine recovery strategy
+            const failureData = this.#connection_failures.get(original_mac) || { count: 0 };
+            if (failureData.count > 20) {
+                debugLog(1, `[BLE RECOVERY] High failure count (${failureData.count}) detected - attempting BLE stack recovery`);
+                this.#attemptBLEStackRecovery(dev_addr, original_mac, response_callback);
+            } else {
+                // Regular timeout handling
+                const callbacks = this.#active_connections.get(`temp_${original_mac}`) || [];
+                callbacks.forEach(callback => {
+                    callback({
+                        connected: false,
+                        mac: dev_addr,
+                        original_mac: original_mac,
+                        mac_changed: false,
+                        status: "mstConnect_timeout"
+                    });
+                });
+            }
+        }, 15000); // 15 second timeout for mstConnect
+        
         hmBle.mstConnect(dev_addr_ab, (result) => {
+            SysTimer.clear(connectTimeout); // Clear timeout on response
             debugLog(2, "[DEBUG] mstConnect callback fired for", dev_addr, "Result:", JSON.stringify(result));
             // Handle MAC address discrepancy
             const backend_mac = ab2mac(result.dev_addr);
@@ -735,6 +974,7 @@ export class BLEMaster {
                 original_mac: original_mac,
                 mac_changed: mac_changed
             };
+            debugLog(2, `[CALLBACK DEBUG] result_mod created:`, JSON.stringify(result_mod));
 
             if (result_mod.connected === 0) {
                 debugLog(2, "[DEBUG] mstConnect: Connection successful, calling response_callback with connected=true for", dev_addr);
@@ -754,12 +994,57 @@ export class BLEMaster {
 
                 debugLog(1, 'Connected devices:', JSON.stringify(this.#devices));
                 this.#handleSuccessfulConnection(result_mod);
-                response_callback({ 
+                
+                // Reset connection failure count on successful connection
+                if (this.#connection_failures.has(original_mac)) {
+                    debugLog(2, `[THROTTLE] Successful connection for ${original_mac}, resetting failure count`);
+                    this.#connection_failures.delete(original_mac);
+                }
+                
+                // Move callbacks from temporary storage to backend MAC (replace old persistent callbacks)
+                debugLog(2, `[CALLBACK DEBUG] Moving callbacks to backend_mac: ${backend_mac}`);
+                
+                const tempCallbacks = this.#active_connections.get(`temp_${original_mac}`) || [];
+                const existingCallbacks = this.#active_connections.get(backend_mac) || [];
+                
+                // Use temp callbacks if available (fresh connection), otherwise existing ones (reconnection)
+                let callbacks;
+                if (tempCallbacks.length > 0) {
+                    // Fresh connection - use new callback only (replace accumulated ones)
+                    callbacks = tempCallbacks;
+                    debugLog(2, `[CALLBACK DEBUG] Using ${tempCallbacks.length} new callbacks (replaced ${existingCallbacks.length} accumulated callbacks)`);
+                } else {
+                    // Reconnection - use existing persistent ones
+                    callbacks = existingCallbacks;
+                    debugLog(2, `[CALLBACK DEBUG] Using ${existingCallbacks.length} existing persistent callbacks`);
+                }
+                
+                // Always store under backend MAC only
+                this.#active_connections.set(backend_mac, callbacks);
+                
+                // Clean up temporary storage
+                if (this.#active_connections.has(`temp_${original_mac}`)) {
+                    this.#active_connections.delete(`temp_${original_mac}`);
+                    debugLog(2, `[CALLBACK DEBUG] Moved ${callbacks.length} callbacks from temp storage to backend MAC: ${backend_mac}`);
+                }
+                
+                debugLog(2, `[CALLBACK DEBUG] Active connections keys:`, Array.from(this.#active_connections.keys()));
+                const response = { 
                     connected: true, 
                     mac: backend_mac, 
                     original_mac: original_mac,
                     mac_changed: mac_changed,
                     status: "connected" 
+                };
+                debugLog(2, `[CALLBACK DEBUG] Calling ${callbacks.length} callbacks for ${original_mac} disconnect/fail`);
+                callbacks.forEach((callback, index) => {
+                    try {
+                        debugLog(2, `[CALLBACK DEBUG] Calling callback ${index} with response:`, JSON.stringify(response));
+                        callback(response);
+                        debugLog(2, `[CALLBACK DEBUG] Callback ${index} completed successfully`);
+                    } catch (error) {
+                        debugLog(1, `Error calling connection callback ${index}: ${error}`);
+                    }
                 });
             } else {
                 debugLog(2, "[DEBUG] mstConnect: Disconnection or failure, calling response_callback with connected=false for", dev_addr);
@@ -767,15 +1052,90 @@ export class BLEMaster {
                     debugLog(1, 'Disconnection happened');
                     this.#devices[dev_addr].is_connected = false;
                 }
-                response_callback({ 
+                
+                // Move callbacks from temporary storage to backend MAC (replace old persistent callbacks)
+                debugLog(2, `[CALLBACK DEBUG] Moving callbacks to backend_mac: ${backend_mac}`);
+                
+                const tempCallbacks = this.#active_connections.get(`temp_${original_mac}`) || [];
+                const existingCallbacks = this.#active_connections.get(backend_mac) || [];
+                
+                // Use temp callbacks if available (fresh connection), otherwise existing ones (reconnection)
+                let callbacks;
+                if (tempCallbacks.length > 0) {
+                    // Fresh connection - use new callback only (replace accumulated ones)
+                    callbacks = tempCallbacks;
+                    debugLog(2, `[CALLBACK DEBUG] Using ${tempCallbacks.length} new callbacks (replaced ${existingCallbacks.length} accumulated callbacks)`);
+                } else {
+                    // Reconnection - use existing persistent ones
+                    callbacks = existingCallbacks;
+                    debugLog(2, `[CALLBACK DEBUG] Using ${existingCallbacks.length} existing persistent callbacks`);
+                }
+                
+                // Always store under backend MAC only
+                this.#active_connections.set(backend_mac, callbacks);
+                
+                // Clean up temporary storage
+                if (this.#active_connections.has(`temp_${original_mac}`)) {
+                    this.#active_connections.delete(`temp_${original_mac}`);
+                    debugLog(2, `[CALLBACK DEBUG] Moved ${callbacks.length} callbacks from temp storage to backend MAC: ${backend_mac}`);
+                }
+                
+                debugLog(2, `[CALLBACK DEBUG] Active connections keys:`, Array.from(this.#active_connections.keys()));
+                
+                // No longer need orphaned callback fallback - callbacks should always be persistent
+                debugLog(2, `[CALLBACK DEBUG] Found ${callbacks.length} persistent callbacks for ${original_mac}`);
+                
+                const response = { 
                     connected: false, 
                     mac: backend_mac,
                     original_mac: original_mac,
                     mac_changed: mac_changed,
                     status: result_mod.connected === 1 ? "failed" : "disconnected" 
+                };
+                
+                // Clean up profile instance for both failures and disconnections to prevent blocking reconnection
+                if (this.#devices[backend_mac]?.profile_pid) {
+                    debugLog(2, `[CLEANUP] Destroying stale profile instance ${this.#devices[backend_mac].profile_pid} for ${backend_mac}`);
+                    hmBle.mstDestroyProfileInstance(this.#devices[backend_mac].profile_pid);
+                    delete this.#devices[backend_mac].profile_pid;
+                }
+                
+                // Track connection failures for throttling (only for actual failures, not normal disconnections)
+                if (result_mod.connected === 1) { // Connection failed
+                    const failureData = this.#connection_failures.get(original_mac) || { count: 0, lastFailure: 0 };
+                    failureData.count++;
+                    failureData.lastFailure = Date.now();
+                    this.#connection_failures.set(original_mac, failureData);
+                    debugLog(2, `[THROTTLE] Connection failure ${failureData.count} recorded for ${original_mac}`);
+                    
+                    // After 4 consecutive failures, warn about potential issues
+                    if (failureData.count >= 4) {
+                        debugLog(1, `[RECONNECT DEBUG] Device ${original_mac} has ${failureData.count} consecutive failures, investigating cause`);
+                        // Add detailed debugging for connection failures
+                        debugLog(1, `[RECONNECT DEBUG] Last failure reason: ${result_mod.reason}, connect_id: ${result_mod.connect_id}`);
+                        debugLog(1, `[RECONNECT DEBUG] Device state: is_connected=${this.#devices[original_mac]?.is_connected}, profile_pid=${this.#devices[original_mac]?.profile_pid}`);
+                    }
+                } else if (result_mod.connected === 2) { // Normal disconnection, reset failure count
+                    if (this.#connection_failures.has(original_mac)) {
+                        debugLog(2, `[THROTTLE] Normal disconnection detected for ${original_mac}, resetting failure count`);
+                        this.#connection_failures.delete(original_mac);
+                    }
+                }
+                
+                debugLog(2, `[CALLBACK DEBUG] Calling ${callbacks.length} callbacks for ${original_mac} disconnect/fail`);
+                callbacks.forEach((callback, index) => {
+                    try {
+                        debugLog(2, `[CALLBACK DEBUG] Calling callback ${index} with response:`, JSON.stringify(response));
+                        callback(response);
+                        debugLog(2, `[CALLBACK DEBUG] Callback ${index} completed successfully`);
+                    } catch (error) {
+                        debugLog(1, `Error calling connection callback ${index}: ${error}`);
+                    }
                 });
             }
 
+            // Keep callback queue persistent for session continuity (prevents listener conflicts)
+            debugLog(2, `[CALLBACK DEBUG] Keeping callback queue persistent for backend MAC: ${backend_mac} to maintain session continuity`);
             this.#connection_in_progress = false;
         });
     }
@@ -810,6 +1170,34 @@ export class BLEMaster {
     static SetDebugLevel(debug_level){
         DEBUG_LOG_LEVEL = debug_level;
     }
+
+    /**
+     * Explicitly clears persistent callbacks for a device (stops reconnection)
+     * @param {string} dev_addr - Device MAC address
+     */
+    stopReconnection(dev_addr) {
+        const original_mac = dev_addr.toLowerCase();
+        // Find the backend MAC to check for stored callbacks
+        const backend_mac = this.#findBackendMacForOriginal(original_mac);
+        
+        if (backend_mac && this.#active_connections.has(backend_mac)) {
+            debugLog(2, `[CALLBACK DEBUG] Explicitly stopping reconnection for backend MAC: ${backend_mac}`);
+            this.#active_connections.delete(backend_mac);
+            return true;
+        }
+        
+        debugLog(2, `[CALLBACK DEBUG] No active reconnection found for ${original_mac} (backend MAC: ${backend_mac || 'unknown'})`);
+        return false;
+    }
+
+    /**
+     * Clears all persistent callbacks (stops all reconnections)
+     */
+    stopAllReconnections() {
+        debugLog(2, `[CALLBACK DEBUG] Explicitly stopping all reconnections`);
+        this.#active_connections.clear();
+    }
+
 }
 
 //A tester : migrer vers DevinceConnection pour gerer les callback de façon plus propre
@@ -952,7 +1340,7 @@ class Write {
 
     #performDescriptorWrite(chara, desc, data, callback) {
         const device = this.#getCurrentDevice();
-        console.log("BLK performCharaWrite, pid is: ", device.profile_pid); // J'ai un doute que #getCurrentDevice() renvoie le bon device
+        // Performing descriptor write operation
         if (!device || device.profile_pid === undefined) {
             debugLog(1, ERR.PID_NOT_FOUND);
             callback(); // failed operation
@@ -1406,7 +1794,7 @@ class On {
 
             // Ensure the notification is for the correct profile_pid
          //   if (this.#profile_pid === profile) {
-           //     console.log(`Notification received for profile_pid: ${profile}, uuid: ${uuid}`);
+           // Notification received
                 if (this._cb_charaNotification) {
                     this._cb_charaNotification(uuid, data, length);
                 } else {
@@ -1623,11 +2011,8 @@ class Get {
      * @returns {boolean} True if the device is connected, false otherwise.
      */
     isConnected(dev_addr){
-      //  console.log(`BLK_Chck: checking if mac ${dev_addr} is connected`);
         const devices = this.#getDevices()
-       // console.log(`BLK_Chck: available devices ${JSON.stringify(devices)}`);
         const device=devices[dev_addr];
-      //  console.log(`BLK_Chck: device ${JSON.stringify(device)}`);
         return device && device.is_connected;
     }
 
